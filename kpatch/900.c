@@ -17,6 +17,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
 
 // 9.00
 
+#include <stddef.h>
+
 #include "types.h"
 #include "utils.h"
 
@@ -29,44 +31,39 @@ struct kexec_args {
     u64 arg5;
 };
 
-static inline void restore(void *kbase, struct kexec_args *uap);
-static inline void do_patch(void *kbase);
+void do_patch(void);
+void restore(struct kexec_args *uap);
 
 __attribute__((section (".text.start")))
 int kpatch(void *td, struct kexec_args *uap) {
-    const u64 xfast_syscall_off = 0x1c0;
-    void * const kbase = (void *)rdmsr(0xc0000082) - xfast_syscall_off;
-
-    do_patch(kbase);
-    restore(kbase, uap);
-
+    do_patch();
+    restore(uap);
     return 0;
 }
 
-__attribute__((always_inline))
-static inline void restore(void *kbase, struct kexec_args *uap) {
+void restore(struct kexec_args *uap) {
     u8 *pipe = uap->arg1;
     u8 *pipebuf = uap->arg2;
-    for (int i = 0; i < 0x18; i++) {
+    for (size_t i = 0; i < 0x18; i++) {
         pipe[i] = pipebuf[i];
     }
     u64 *pktinfo_field = uap->arg3;
     *pktinfo_field = 0;
     u64 *pktinfo_field2 = uap->arg4;
     *pktinfo_field2 = 0;
-
-    u64 *sysent_661_save = uap->arg5;
-    for (int i = 0; i < 0x30; i += 8) {
-        write64(kbase, 0x1107f00 + i, sysent_661_save[i / 8]);
-    }
 }
 
-__attribute__((always_inline))
-static inline void do_patch(void *kbase) {
+void do_patch(void) {
+    // offset to fast_syscall()
+    const size_t off_fast_syscall = 0x1c0;
+    void * const kbase = (void *)rdmsr(0xc0000082) - off_fast_syscall;
+
     disable_cr0_wp();
 
-    // ChendoChap's patches from pOOBs4
-    write16(kbase, 0x626874, 0x00eb); // veriPatch
+    // ChendoChap's patches from pOOBs4 ///////////////////////////////////////
+
+    // Initial patches
+    write16(kbase, 0x626874, 0x9090); // veriPatch
     write8(kbase, 0xacd, 0xeb); // bcopy
     write8(kbase, 0x2713fd, 0xeb); // bzero
     write8(kbase, 0x271441, 0xeb); // pagezero
@@ -75,9 +72,6 @@ static inline void do_patch(void *kbase) {
     write8(kbase, 0x2716ad, 0xeb); // copyin
     write8(kbase, 0x271b5d, 0xeb); // copyinstr
     write8(kbase, 0x271c2d, 0xeb); // copystr
-
-    // stop sysVeri from causing a delayed panic on suspend
-    write16(kbase, 0x62715f, 0x00eb);
 
     // patch amd64_syscall() to allow calling syscalls everywhere
     // struct syscall_args sa; // initialized already
@@ -114,8 +108,8 @@ static inline void do_patch(void *kbase) {
     //
     // sy_call() is the function that will execute the requested syscall.
     write8(kbase, 0x4c2, 0xeb);
-    write16(kbase, 0x4b9, 0x00eb);
-    write16(kbase, 0x4b5, 0x00eb);
+    write16(kbase, 0x4b9, 0x9090);
+    write16(kbase, 0x4b5, 0x9090);
 
     // patch sys_setuid() to allow freely changing the effective user ID
     // ; PRIV_CRED_SETUID = 50
@@ -132,9 +126,9 @@ static inline void do_patch(void *kbase) {
     //     vm_map_unlock(map);
     //     return (KERN_PROTECTION_FAILURE);
     // }
-    write16(kbase, 0x80b8b, 0x04eb);
+    write32(kbase, 0x80b8d, 0);
 
-    // TODO: Description of this patch. patch sys_dynlib_load_prx()
+    // TODO: Description of this patch. "prx"
     write16(kbase, 0x23aec4, 0xe990);
 
     // patch sys_dynlib_dlsym() to allow dynamic symbol resolution everywhere
@@ -182,13 +176,12 @@ static inline void do_patch(void *kbase) {
     // int sys_kexec(struct thread td, struct args *uap) {
     //     asm("jmp qword ptr [rsi]");
     // }
-    const u64 sysent_11_off = 0x1100520;
     // .sy_narg = 2
-    write32(kbase, sysent_11_off, 2);
+    write32(kbase, 0x1100520, 2);
     // .sy_call = gadgets['jmp qword ptr [rsi]']
-    write64(kbase, sysent_11_off + 8, kbase + 0x4c7ad);
+    write64(kbase, 0x1100520 + 8, kbase + 0x4c7ad);
     // .sy_thrcnt = SY_THR_STATIC
-    write32(kbase, sysent_11_off + 0x2c, 1);
+    write32(kbase, 0x1100520 + 0x2c, 1);
 
     enable_cr0_wp();
 }

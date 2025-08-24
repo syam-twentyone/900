@@ -1,12 +1,14 @@
 CACHE MANIFEST 
 # LapseTwentyone_900
 
+about.html
 alert.mjs
 cache.html
 config.mjs
 index.html
 lapse.mjs
-payload.bin
+aio_patches.bin
+goldhen.bin
 psfree.mjs
 fonts\LiberationMono-Regular.ttf
 kpatch\900.elf
@@ -19,8 +21,6 @@ module\offset.mjs
 module\rw.mjs
 module\utils.mjs
 module\view.mjs
-module\cache.png
-module\bg.png
 rop\900.mjs
 
 NETWORK:

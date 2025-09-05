@@ -1,15 +1,17 @@
-# PSFree version 1.5.0
+# PSFree version 1.5.0b with AIO Fix
 
-Lapse Kex ported to 9.00 - Still WIP
+Lapse Kex ported to 9.00
 
-Very fast and reliable but can KP :P
+Very fast and reliable! Around 80% stability rate.
 
-Warning: This repository is a work in progress. Do not use it by default—or better yet, don’t use it at all—until I and/or someone else declare it stable. There are issues with certain games, such as black screens, problems with save data, and multiple kernel panics. The offsets for PS4 9.00 still need to be verified. If you choose to use it, do so at your own risk.
+Update: I've added an payload having some process_dtor_handler patches related to aio bugs.. Now all games should work properly.. patches were made by abc for 8.0x and I ported to 9.00. Thx a lot to Sistro and CTN for some explanation on low level coding!!! :)
 
-TODO:
-- Fix game issues. Black screen. Saves. No boot
-  
-PR are welcome 
+# HOW TO
+* delete cache & Cookies and cache again. Note: this is still beta and it's only
+for PS4 9.00fw.
+* Only support PSfree + Lapse, should fix same bugs fixed by the GoldHEN plugin. if
+you're on 900 and have plugin loader enabled, disable it or delete the plugin and
+test this in host fix. Special thx to ABC, Sistro and CTN
 
 PSFree is a collection of exploits for the PS4 console. The main focus of the 
 repo is for the PS4 but we try to make things portable to PS5.
